@@ -31,7 +31,7 @@ int main()
 		MemoryPointer<char> testTwo = MEM_CREATE<char>(MEM_NEW(20 * MB) char*);
 
 		//reassigning 1 smart pointer to another. One went out of scope and should deallocate
-		testTwo = testOne;
+		testTwo = &testOne;
 
 		//test the MEM_USE macro with a class about 1MB in space. This should allocate back onto the first block
 		MemoryPointer<TestClass> testThree = MEM_CREATE<TestClass>(new TestClass());
@@ -45,9 +45,8 @@ int main()
 		cout << "Test four name: " << testThree->GetName() << endl;
 
 		//last test. We'll initialize a value here but we'll assign it to a different smart pointer out of scope. Once this leaves scope the data shouldnt be deleted.
-		MemoryPointer<TestClass> testSix = MEM_CREATE<TestClass>(new TestClass());
-		testSix->Test();
-		testFive = testSix;
+		testFive = MemoryManager::CreateSmartPointer<TestClass>(new TestClass());
+		testFive->Test();
 
 	}//once scope is left all other memory EXCEPT testSix should automatically deallocate
 

@@ -21,7 +21,7 @@
 #define MEM_USE public: void * operator new(size_t size) { void* p = MEM_ALLOCATE(size); return p; } void operator delete(void * p) { MemoryManager::DeallocateMemory(p); } private: 
 
 //Use for creating MemoryPointers. The merits involve automatic deallocation, and safe defragmentation.
-#define MEM_CREATE MemoryManager::GetDataReference
+#define MEM_CREATE MemoryManager::CreateSmartPointer
 
 struct MemoryNode;
 struct ObjectDataBlock;
@@ -88,24 +88,32 @@ struct MemoryPointer
 		RefCount = new (MEM_ALLOCATE(sizeof(unsigned int))) unsigned int(1);
 	}
 
-	inline void operator =(MemoryPointer<Object> & obj)
+	inline MemoryPointer<Object>& operator =(MemoryPointer<Object>* obj)
 	{
-		if (RefCount != nullptr)
+		if (this != obj)
 		{
-			(*RefCount)--;
+			AttemptDelete();
 
-			if ((*RefCount) == 0)
-			{
-				MEM_DEL(RefCount);
-				if (MemoryRef != nullptr)
-					if (*MemoryRef != nullptr)
-						MEM_DEL(*MemoryRef);
-			}
+			MemoryRef = obj->MemoryRef;
+			RefCount = obj->RefCount;
+			(*RefCount)++;
 		}
+		return *this;
+	}
 
-		MemoryRef = obj.MemoryRef;
-		(*obj.RefCount)++;
-		RefCount = obj.RefCount;
+	inline MemoryPointer<Object>& operator=(MemoryPointer<Object> obj)
+	{
+		if (this != &obj)
+		{
+			AttemptDelete();
+			MemoryRef = obj.MemoryRef;
+			RefCount = obj.RefCount;
+
+			//increment by 2 so the reference count doesnt cause the copy to delete itself when it leaves stack scope
+			(*RefCount)++;
+			(*RefCount)++;
+		}
+		return *this;
 	}
 
 	inline Object* operator ->()
@@ -113,22 +121,19 @@ struct MemoryPointer
 		return (Object*)(*MemoryRef);
 	}
 
+	inline void Copy(MemoryPointer<Object>& obj)
+	{
+		AttemptDelete();
+
+		MemoryRef = obj.MemoryRef;
+		RefCount = obj.RefCount;
+		(*RefCount)++;
+	}
 
 
 	~MemoryPointer()
 	{
-		if (RefCount != nullptr)
-		{
-			(*RefCount)--;
-
-			if ((*RefCount) == 0)
-			{
-				MEM_DEL(RefCount);
-				if (MemoryRef != nullptr)
-					if (*MemoryRef != nullptr)
-						MEM_DEL(*MemoryRef);
-			}
-		}
+		AttemptDelete();
 	}
 
 	Object* Get()
@@ -138,6 +143,22 @@ struct MemoryPointer
 
 
 private:
+
+	void AttemptDelete()
+	{
+		if (RefCount != nullptr)
+		{
+			(*RefCount)--;
+
+			if ((*RefCount) == 0)
+			{
+				MEM_DEL(RefCount);
+				if (MemoryRef != nullptr)
+					if (*MemoryRef != nullptr)
+						MEM_DEL(*MemoryRef);
+			}
+		}
+	}
 
 	unsigned char** MemoryRef;
 	unsigned int* RefCount;
@@ -268,7 +289,7 @@ public:
 
 	static inline double GetFragmentationCount()
 	{
-		std::vector<std::pair<size_t,double>> percentagesPerBlock;
+		std::vector<std::pair<size_t,double>> percentNotFragmentedPerBlock;
 		size_t totalSpaceReserved = 0;
 
 		for (ObjectDataBlock* i = GetHead(); i != nullptr; i = i->m_Previous)
@@ -288,17 +309,17 @@ public:
 			else
 				percent = (double)totalDataUsedInThisBlock / (double)i->m_MemoryIterator;
 
-			percentagesPerBlock.push_back(std::pair<size_t, double>(i->m_BlockSize, percent));
+			percentNotFragmentedPerBlock.push_back(std::pair<size_t, double>(i->m_BlockSize, percent));
 			totalSpaceReserved += i->m_BlockSize;
 		}
 
 		//weigh our blocks and convert into 1 big percentage
 		double totalPercentNotFragmented = 0.0;
 
-		for (unsigned int i = 0; i < percentagesPerBlock.size(); i++)
+		for (unsigned int i = 0; i < percentNotFragmentedPerBlock.size(); i++)
 		{
-			double ratio = (double)percentagesPerBlock[i].first / (double)totalSpaceReserved;
-			totalPercentNotFragmented += percentagesPerBlock[i].second * ratio;
+			double ratio = (double)percentNotFragmentedPerBlock[i].first / (double)totalSpaceReserved;
+			totalPercentNotFragmented += percentNotFragmentedPerBlock[i].second * ratio;
 		}
 
 		return (1.0 - totalPercentNotFragmented) * 100.0;
@@ -442,7 +463,7 @@ public:
 	//Returns a reference to the internal pointer used by the memory manager.
 	//If defragmentation is enabled. USE THIS OR RISK LOSIG MEMORY!
 	template <class TYPE>
-	static inline MemoryPointer<TYPE> GetDataReference(void* p)
+	static inline MemoryPointer<TYPE> CreateSmartPointer(void* p)
 	{
 		for (ObjectDataBlock* a = m_CurrentBlock; a != nullptr; a = m_CurrentBlock->m_Previous)
 		{
