@@ -2,6 +2,7 @@
 #include <malloc.h>
 #include <vector>
 #include <assert.h>
+#include <Windows.h>
 
 #define KB 1024
 #define MB KB * KB
@@ -19,12 +20,21 @@
 //Define this on any classes that will be managed by this memory manager to automatically convert the new/delete operators to use this MemoryManager instead.
 #define MEM_USE public: void * operator new(size_t size) { void* p = MEM_ALLOCATE(size); return p; } void operator delete(void * p) { MemoryManager::DeallocateMemory(p); } private: 
 
-//if you want your memory pointers to automatically adapt to deletes and potential movement of memory to avoid fragmenting issues, use this.
-#define MEM_CREATE(__PTR) MemoryManager::GetDataReference(__PTR)
+//Use for creating MemoryPointers. The merits involve automatic deallocation, and safe defragmentation.
+#define MEM_CREATE MemoryManager::GetDataReference
 
 struct MemoryNode;
 struct ObjectDataBlock;
 struct MemoryNodeBlock;
+
+//each allocation on the memory manager will have a node that keeps track of all its data. this effectively increases the allocation of each object by 32 bytes.
+struct MemoryNode
+{
+	unsigned char* m_Object;
+	ObjectDataBlock* m_Block;
+	size_t m_SizeOfAllocation;
+	size_t m_IteratorBeforeAllocation;
+};
 
 //this block keeps all objects the user cares about in storage here. Each block keeps a vector of each object it has in its data allocation, a data block with an iterator and limit, and pointers to front and back
 //this is functionally a doubly-linked list of memory blocks.
@@ -36,7 +46,10 @@ struct ObjectDataBlock
 		if (m_Previous != nullptr)
 			delete m_Previous;
 		if (m_MemoryBlock != nullptr)
+		{
+			ZeroMemory(m_MemoryBlock, m_BlockSize);
 			free(m_MemoryBlock);
+		}
 	}
 
 	unsigned char* m_MemoryBlock = nullptr;
@@ -66,13 +79,69 @@ struct MemoryNodeBlock
 	MemoryNodeBlock * m_Previous = nullptr;
 };
 
-//each allocation on the memory manager will have a node that keeps track of all its data. this effectively increases the allocation of each object by 32 bytes.
-struct MemoryNode
+template<class Object>
+struct MemoryPointer
 {
-	unsigned char* m_Object;
-	ObjectDataBlock* m_Block;
-	size_t m_SizeOfAllocation;
-	size_t m_IteratorBeforeAllocation;
+	MemoryPointer() : MemoryRef(nullptr), RefCount(nullptr) {}
+	MemoryPointer(unsigned char** mem) : MemoryRef(mem), RefCount() 
+	{
+		RefCount = new (MEM_ALLOCATE(sizeof(unsigned int))) unsigned int(1);
+	}
+
+	inline void operator =(MemoryPointer<Object> & obj)
+	{
+		if (RefCount != nullptr)
+		{
+			(*RefCount)--;
+
+			if ((*RefCount) == 0)
+			{
+				MEM_DEL(RefCount);
+				if (MemoryRef != nullptr)
+					if (*MemoryRef != nullptr)
+						MEM_DEL(*MemoryRef);
+			}
+		}
+
+		MemoryRef = obj.MemoryRef;
+		(*obj.RefCount)++;
+		RefCount = obj.RefCount;
+	}
+
+	inline Object* operator ->()
+	{
+		return (Object*)(*MemoryRef);
+	}
+
+
+
+	~MemoryPointer()
+	{
+		if (RefCount != nullptr)
+		{
+			(*RefCount)--;
+
+			if ((*RefCount) == 0)
+			{
+				MEM_DEL(RefCount);
+				if (MemoryRef != nullptr)
+					if (*MemoryRef != nullptr)
+						MEM_DEL(*MemoryRef);
+			}
+		}
+	}
+
+	Object* Get()
+	{
+		return (Object*)(*MemoryRef);
+	}
+
+
+private:
+
+	unsigned char** MemoryRef;
+	unsigned int* RefCount;
+
 };
 
 //Dayton's first Memory Manager.
@@ -145,6 +214,9 @@ private:
 	static inline ObjectDataBlock* GetHead()
 	{
 		ObjectDataBlock* head = m_CurrentBlock;
+		if (head == nullptr)
+			return nullptr;
+
 		while (head->m_Next != nullptr)
 			head = head->m_Next;
 
@@ -157,23 +229,79 @@ public:
 	//of some CPU power.
 	static inline void Initialize(size_t SizeOfBlocks, bool EnableDefrag = true)
 	{
-		m_EnableDefragmentation = true;
-		m_BlockSize = SizeOfBlocks;
-		unsigned char* memory = (unsigned char*)malloc(m_BlockSize);
-		m_CurrentBlock = new ObjectDataBlock(m_BlockSize, &memory[0]);
+		//don't initialize if we already have
+		if (m_CurrentBlock != nullptr)
+			return;
 
-		memory = (unsigned char*)malloc(sizeof(MemoryNode) * 100);
+		m_EnableDefragmentation = EnableDefrag;
+		m_BlockSize = SizeOfBlocks;
+
+		//create our object block
+		unsigned char* memory = new unsigned char[m_BlockSize]{ '\0' };
+		m_CurrentBlock = new ObjectDataBlock(m_BlockSize, &memory[0]);
+		
+		//create our node block
+		memory = new unsigned char[sizeof(MemoryNode) * 100] { '\0' };
 		m_CurrentNode = new MemoryNodeBlock(&memory[0]);
 
 		m_BlockCount = 1;
 	}
 
+	//return the total amount of bytes we're managing.
+	static inline size_t GetTotalMemoryUsed()
+	{
+		size_t size = 0;
+		for (ObjectDataBlock* p = GetHead(); p != nullptr; p = p->m_Previous)
+			size += p->m_BlockSize;
+
+		return size;
+	}
 	//Disable the Memory Manager.
 	static inline void Shutdown()
 	{
 		delete GetHead();
 		delete m_CurrentNode;
 		m_BlockCount = 0;
+		m_CurrentBlock = nullptr;
+		m_CurrentNode = nullptr;
+	}
+
+	static inline double GetFragmentationCount()
+	{
+		std::vector<std::pair<size_t,double>> percentagesPerBlock;
+		size_t totalSpaceReserved = 0;
+
+		for (ObjectDataBlock* i = GetHead(); i != nullptr; i = i->m_Previous)
+		{
+			size_t totalDataUsedInThisBlock = 0;
+
+			//get total data used
+			for (unsigned int a = 0; a < i->m_Objects.size(); a++)
+				//check if the object pointer is null. if it is that means this object has been dealloacted and is not part of the calculation
+				if (i->m_Objects[a]->m_Object != nullptr)
+				totalDataUsedInThisBlock += i->m_Objects[a]->m_SizeOfAllocation;
+
+			//convert to percent
+			double percent;
+			if (i->m_MemoryIterator == 0)
+				percent = 1.0;
+			else
+				percent = (double)totalDataUsedInThisBlock / (double)i->m_MemoryIterator;
+
+			percentagesPerBlock.push_back(std::pair<size_t, double>(i->m_BlockSize, percent));
+			totalSpaceReserved += i->m_BlockSize;
+		}
+
+		//weigh our blocks and convert into 1 big percentage
+		double totalPercentNotFragmented = 0.0;
+
+		for (unsigned int i = 0; i < percentagesPerBlock.size(); i++)
+		{
+			double ratio = (double)percentagesPerBlock[i].first / (double)totalSpaceReserved;
+			totalPercentNotFragmented += percentagesPerBlock[i].second * ratio;
+		}
+
+		return (1.0 - totalPercentNotFragmented) * 100.0;
 	}
 
 	//Allocate a chunk of memory for something. Will also create new blocks if an allocation is too big to fit.
@@ -184,8 +312,8 @@ public:
 		//get our node block to write our memory to
 		if (m_CurrentNode->m_NodeCounter >= 100)
 		{
-			unsigned char* memory = (unsigned char*)malloc(sizeof(MemoryNode) * 100 + sizeof(MemoryNodeBlock));
-			MemoryNodeBlock* newNodeBlock = new(memory) MemoryNodeBlock(&memory[0 + sizeof(MemoryNodeBlock)]);
+			unsigned char* memory = new unsigned char[sizeof(MemoryNode) * 100] {'\0'};
+			MemoryNodeBlock* newNodeBlock = new MemoryNodeBlock(&memory[0]);
 			newNodeBlock->m_Previous = m_CurrentNode;
 			m_CurrentNode = newNodeBlock;
 		}
@@ -211,7 +339,7 @@ public:
 
 				size_t blockSize = m_BlockSize > size ? m_BlockSize : size;
 
-				unsigned char* memory = (unsigned char*)malloc(blockSize + sizeof(ObjectDataBlock));
+				unsigned char* memory = new unsigned char[blockSize] {'\0'};
 				ObjectDataBlock * newBlock = new ObjectDataBlock(blockSize, &memory[0]);
 				
 				newBlock->m_Previous = m_CurrentBlock;
@@ -254,35 +382,53 @@ public:
 				if (p == (*it)->m_Object)
 				{
 					//this is the node we're removing from the object list
-					auto itToRemove = it;
+					MemoryNode* itToRemove = *it;
+					auto itToErase = it;
+
+					//figure out how many bytes we're retrieving
+					size_t allocBefore = itToRemove->m_IteratorBeforeAllocation;
+					size_t allocAfter = allocBefore + itToRemove->m_SizeOfAllocation;
+					size_t sizeOfDataToRemove = allocAfter - allocBefore;
 
 					//if defragmentation is enabled then we need to adjust everything ahead of the deleted object to push them all back
 					if (m_EnableDefragmentation)
 					{
 						//figure out how many bytes we're retrieving
-						size_t allocBefore = (*it)->m_IteratorBeforeAllocation;
-						size_t allocAfter = allocBefore + (*it)->m_SizeOfAllocation;
-						size_t allocCurrent = (*it)->m_Block->m_MemoryIterator;
+						size_t sizeOfDataBlockAfterRemoval = a->m_MemoryIterator - allocAfter;
 
-						//move all the data in front of the allocattion back equal to the amount of bytes we're retrieving
-						memmove(&(*it)->m_Block->m_MemoryBlock[allocBefore], &(*it)->m_Block->m_MemoryBlock[allocAfter], allocCurrent - allocAfter);
-						(*it)->m_Block->m_MemoryIterator -= (*it)->m_SizeOfAllocation;
+						//move all the data in front of the allocation back equal to the amount of bytes we're retrieving
+						memmove((void*)&a->m_MemoryBlock[allocBefore], (void*)&a->m_MemoryBlock[allocAfter], sizeOfDataBlockAfterRemoval);
+
+						//adjust the iterator back X bytes
+						a->m_MemoryIterator -= itToRemove->m_SizeOfAllocation;
 
 						//move the iterator forward and adjust all other memory nodes accordingly
 						it++;
 
-						//have every node move their memory reference and allocater back an equal amount of bytes to the allocation so they're still pointing in the right place
+						//have every node move their memory reference and iterator back an equal amount of bytes to the allocation so they're still pointing in the right place
 						for (it; it != a->m_Objects.end(); ++it)
 							if ((*it)->m_IteratorBeforeAllocation > allocBefore)
 							{
-								(*it)->m_IteratorBeforeAllocation -= (*itToRemove)->m_SizeOfAllocation;
-								((*it)->m_Object) = &a->m_MemoryBlock[(*it)->m_IteratorBeforeAllocation];
+								(*it)->m_IteratorBeforeAllocation -= itToRemove->m_SizeOfAllocation;
+								(*it)->m_Object -= itToRemove->m_SizeOfAllocation;
 							}
+
+						//clean the data in front of our block to 0 equal to the amount of bytes we retrieved.
+						//void* memToClean = &(a->m_MemoryBlock[a->m_MemoryIterator]);
+						//ZeroMemory(memToClean, sizeOfDataToRemove);
+
+						//since we already defragmented the data we dont need to keep the object values anymore.
+						a->m_Objects.erase(itToErase);
+					}
+					else
+						//we arent defragmenting so we're simply going to null terminate all the bytes inside the structure.
+					{
+						void* memToClean = &(a->m_MemoryBlock[allocBefore]);
+						ZeroMemory(memToClean, sizeOfDataToRemove);
 					}
 		
-					//null out the old object and remove it from the managed objects on the block
-					(*itToRemove)->m_Object = nullptr;
-					a->m_Objects.erase(itToRemove);
+					//null out the old object
+					itToRemove->m_Object = nullptr;
 					return;
 				}
 			}
@@ -295,26 +441,27 @@ public:
 
 	//Returns a reference to the internal pointer used by the memory manager.
 	//If defragmentation is enabled. USE THIS OR RISK LOSIG MEMORY!
-	static inline unsigned char** GetDataReference(void* p)
+	template <class TYPE>
+	static inline MemoryPointer<TYPE> GetDataReference(void* p)
 	{
 		for (ObjectDataBlock* a = m_CurrentBlock; a != nullptr; a = m_CurrentBlock->m_Previous)
 		{
 			for (unsigned int i = 0; i < a->m_Objects.size(); i++)
 				if (a->m_Objects[i]->m_Object == p)
-					return &a->m_Objects[i]->m_Object;
+					return MemoryPointer<TYPE>(&a->m_Objects[i]->m_Object);
 		}
 
 
 		assert(false);
-		return 0;
+		return MemoryPointer<TYPE>();
 	}
 };
 
-__declspec(selectany) unsigned int MemoryManager::m_BlockCount;
+__declspec(selectany) unsigned int MemoryManager::m_BlockCount = 0;
 
-__declspec(selectany) ObjectDataBlock* MemoryManager::m_CurrentBlock;
+__declspec(selectany) ObjectDataBlock* MemoryManager::m_CurrentBlock = nullptr;
 
-__declspec(selectany) struct MemoryNodeBlock* MemoryManager::m_CurrentNode;
+__declspec(selectany) struct MemoryNodeBlock* MemoryManager::m_CurrentNode = nullptr;
 
 __declspec(selectany) bool MemoryManager::m_EnableDefragmentation;
 
